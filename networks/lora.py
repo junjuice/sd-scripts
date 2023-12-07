@@ -15,7 +15,6 @@ import re
 
 RE_UPDOWN = re.compile(r"(up|down)_blocks_(\d+)_(resnets|upsamplers|downsamplers|attentions)_(\d+)_")
 
-
 class LoRAModule(torch.nn.Module):
     """
     replaces forward method of the original Linear, instead of replacing the original Linear module.
@@ -55,16 +54,23 @@ class LoRAModule(torch.nn.Module):
             stride = org_module.stride
             padding = org_module.padding
             self.lora_down = torch.nn.Conv2d(in_dim, self.lora_dim, kernel_size, stride, padding, bias=False)
+            self.lora_gate = torch.nn.Conv2d(in_dim, out_dim, kernel_size, stride, padding, bias=True) #Gate
             self.lora_up = torch.nn.Conv2d(self.lora_dim, out_dim, (1, 1), (1, 1), bias=False)
         else:
             self.lora_down = torch.nn.Linear(in_dim, self.lora_dim, bias=False)
+            self.lora_gate = torch.nn.Linear(in_dim, out_dim, bias=True) #Gate
             self.lora_up = torch.nn.Linear(self.lora_dim, out_dim, bias=False)
 
         if type(alpha) == torch.Tensor:
             alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
         alpha = self.lora_dim if alpha is None or alpha == 0 else alpha
         self.scale = alpha / self.lora_dim
+        #self.scale = torch.nn.Parameter(torch.Tensor([alpha / self.lora_dim])) #Trainable scale
         self.register_buffer("alpha", torch.tensor(alpha))  # 定数として扱える
+
+        #initializing gate weights
+        self.lora_gate.weight.data.normal_(mean=self.scale, std=self.scale/4)
+        self.lora_gate.bias.data.zero_()
 
         # same as microsoft's
         torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
@@ -90,6 +96,7 @@ class LoRAModule(torch.nn.Module):
                 return org_forwarded
 
         lx = self.lora_down(x)
+        gate = torch.nn.functional.tanh(torch.nn.functional.relu(self.lora_gate(x)))
 
         # normal dropout
         if self.dropout is not None and self.training:
@@ -111,9 +118,12 @@ class LoRAModule(torch.nn.Module):
             scale = self.scale
 
         lx = self.lora_up(lx)
+        lx = lx * gate
 
-        return org_forwarded + lx * self.multiplier * scale
-
+        ret = org_forwarded + lx * self.multiplier #* scale
+        ret = ret * (org_forwarded.mean(dim=2-len(lx.size())) / ret.mean(dim=2-len(lx.size())))
+        
+        return ret
 
 class LoRAInfModule(LoRAModule):
     def __init__(
